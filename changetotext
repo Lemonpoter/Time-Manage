@@ -332,7 +332,6 @@ def transcribe_audio(frames):
 
     print("Recognized Text:", recognized_text)
 
-
 # GUI 설정
 root = tk.Tk()
 root.title("음성 인식 일정 추출기")

@@ -240,7 +240,7 @@ def extract_schedule(text):
             core_task = re.sub(r'\s*약속.*$', '', core_task)
 
         # 기타 불필요한 표현 제거
-        core_task = re.sub(r'(?:하기로|하기로 했어|하기로 해|하기로 함|할게|할래|할까|하자|할거야|할거에요).*$', '', core_task)
+        core_task = re.sub(r'(?:하기로|하기로 했어|하기로 해|하기로 함|할게|할래|할까|하자|할거야|할거에요|할 ).*$', '', core_task)
         core_task = core_task.strip()
 
         schedules.append({

@@ -163,7 +163,8 @@ def extract_schedule(text):
     current_date = date.today()
 
     # 고급 패턴으로 상대/절대/자연어 날짜 모두 포함
-    pattern = r'(?:(\d{1,2}월\s*\d{1,2}일|\d{4}-\d{2}-\d{2}|[가-힣\d]+\s*(일|주|개월|년)?\s*(후|뒤)|오늘|내일|모레|같은 날)?)?\s*(오전|오후)?\s*(\d{1,2})시.*?(회의|점심|식사|병원|약속|미팅|전화|만나.*?)'
+    # task 패턴을 일반적인 활동도 포함하도록 수정
+    pattern = r'(?:(\d{1,2}월\s*\d{1,2}일|\d{4}-\d{2}-\d{2}|[가-힣\d]+\s*(일|주|개월|년)?\s*(후|뒤)|오늘|내일|모레|같은 날)?)?\s*(오전|오후)?\s*(\d{1,2})시.*?(?:에|에는|엔|때)?\s*([가-힣\s]+?(?:하|할|하기|예정|있|있어|있음|약속|계획).*?)(?=\s*\d{1,2}월|\s*\d{1,2}시|\s*$)'
     matches = re.findall(pattern, text)
 
     for m in matches:
@@ -227,10 +228,25 @@ def extract_schedule(text):
             hour += 12
         time_obj = time(hour=hour)
 
+        # task 정리 (조사와 종결어미 정리)
+        task = re.sub(r'(?:하기|할|하|있어|있음|예정|계획|거야|줘)$', '', task.strip())
+        task = re.sub(r'(?:에|에는|엔|때)?\s*$', '', task.strip())
+        task = re.sub(r'잡아', '', task.strip())
+
+        # 핵심 활동만 추출
+        core_task = task.strip()
+        if '약속' in core_task:
+            # "점심 약속" -> "점심"
+            core_task = re.sub(r'\s*약속.*$', '', core_task)
+
+        # 기타 불필요한 표현 제거
+        core_task = re.sub(r'(?:하기로|하기로 했어|하기로 해|하기로 함|할게|할래|할까|하자|할거야|할거에요).*$', '', core_task)
+        core_task = core_task.strip()
+
         schedules.append({
             "date": current_date,
             "time": time_obj,
-            "task": task.strip()
+            "task": core_task
         })
 
     return schedules
@@ -331,6 +347,7 @@ def transcribe_audio(frames):
             text_output.insert(tk.END, f"- {s['date']} {s['time']} : {s['task']}\n")
 
     print("Recognized Text:", recognized_text)
+
 
 # GUI 설정
 root = tk.Tk()

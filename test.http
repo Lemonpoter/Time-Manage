@@ -1,0 +1,8 @@
+### 일정 등록 요청
+POST http://localhost:5000/schedules
+Content-Type: application/json
+
+{
+  "title": "GPT 프로젝트 미팅",
+  "time": "2025-04-12 15:30"
+}

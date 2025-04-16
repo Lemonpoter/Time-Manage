@@ -1,0 +1,365 @@
+import whisper
+import sounddevice as sd
+import webrtcvad
+import numpy as np
+import soundfile as sf
+import queue
+import collections
+from threading import Thread
+import tkinter as tk
+import os
+import re
+from datetime import datetime, timedelta, date, time
+from typing import Optional, Union, Tuple
+
+# 모델 로드 (medium 이상 추천)
+model = whisper.load_model("medium")
+
+SAMPLE_RATE = 16000  # Whisper는 16kHz 필요
+CHUNK_SIZE = 320  # 20ms (16000Hz * 0.02s = 320 samples)
+VAD_WINDOW = 50  # 최근 50개의 VAD 결과 확인
+SILENCE_THRESHOLD = 10  # 침묵 감지 임계값 (절반 이상이 무음이면 종료)
+
+vad = webrtcvad.Vad(1)  # 0~3 (높을수록 침묵 감지 정확도 ↑)
+
+# 오디오 큐 (비동기 처리)
+audio_queue = queue.Queue()
+vad_history = collections.deque(maxlen=VAD_WINDOW)
+is_recording = False
+
+
+class DateParser:
+    def __init__(self):
+        # 한글 숫자 매핑
+        self.korean_numbers = {
+            '일': 1, '이': 2, '삼': 3, '사': 4, '오': 5,
+            '육': 6, '칠': 7, '팔': 8, '구': 9, '십': 10,
+            '하나': 1, '둘': 2, '셋': 3, '넷': 4, '다섯': 5,
+            '여섯': 6, '일곱': 7, '여덟': 8, '아홉': 9, '열': 10
+        }
+
+        # 시간 단위 매핑
+        self.time_units = {
+            '초': 'seconds',
+            '분': 'minutes',
+            '시간': 'hours',
+            '일': 'days',
+            '주': 'weeks',
+            '개월': 'months',
+            '년': 'years'
+        }
+
+    def _convert_korean_to_number(self, text: str) -> int:
+        """한글 숫자를 아라비아 숫자로 변환"""
+        if text.isdigit():
+            return int(text)
+
+        for kor, num in self.korean_numbers.items():
+            if text == kor:
+                return num
+        return 0
+
+    def parse_absolute_date(self, text: str) -> Optional[datetime]:
+        """절대적인 날짜 표현을 파싱하여 datetime 객체로 반환"""
+        # 현재 연도를 기준으로 설정
+        current_year = datetime.now().year
+
+        # 월, 일, 시간 패턴 매칭
+        pattern = r'(\d+)월\s*(\d+)일\s*(?:오전|오후)?\s*(\d+)시'
+        match = re.search(pattern, text)
+
+        if not match:
+            return None
+
+        month = int(match.group(1))
+        day = int(match.group(2))
+        hour = int(match.group(3))
+
+        # 오후인 경우 12를 더함
+        if '오후' in text and hour != 12:
+            hour += 12
+
+        try:
+            return datetime(current_year, month, day, hour)
+        except ValueError:
+            return None
+
+    def parse_relative_date(self, text: str, base_date: Optional[datetime] = None) -> Optional[datetime]:
+        """
+        상대적인 날짜 표현을 파싱하여 datetime 객체로 반환
+        예: "3일 후", "일주일 후", "2개월 후" 등
+        """
+        if base_date is None:
+            base_date = datetime.now()
+
+        # 패턴 매칭
+        pattern = r'(\d+|[가-힣]+)\s*([가-힣]+)\s*(후|뒤)'
+        match = re.search(pattern, text)
+
+        if not match:
+            return None
+
+        amount = self._convert_korean_to_number(match.group(1))
+        unit = match.group(2)
+
+        if unit not in self.time_units:
+            return None
+
+        # 시간 단위에 따라 날짜 계산
+        if self.time_units[unit] == 'months':
+            # 개월 단위는 특별 처리
+            new_month = base_date.month + amount
+            new_year = base_date.year + (new_month - 1) // 12
+            new_month = ((new_month - 1) % 12) + 1
+            return base_date.replace(year=new_year, month=new_month)
+        elif self.time_units[unit] == 'years':
+            return base_date.replace(year=base_date.year + amount)
+        else:
+            # timedelta로 처리 가능한 단위들
+            kwargs = {self.time_units[unit]: amount}
+            return base_date + timedelta(**kwargs)
+
+    def parse(self, text: str) -> Tuple[Optional[datetime], Optional[datetime]]:
+        """
+        날짜 문자열을 파싱하여 (절대 날짜, 상대 날짜) 튜플로 반환
+        """
+        absolute_date = None
+        relative_date = None
+
+        # 절대 날짜 파싱
+        absolute_date = self.parse_absolute_date(text)
+
+        # 상대 날짜 파싱 (절대 날짜가 있는 경우 이를 기준으로 계산)
+        if '후' in text or '뒤' in text:
+            base_date = absolute_date if absolute_date else datetime.now()
+            relative_date = self.parse_relative_date(text, base_date)
+
+        return absolute_date, relative_date
+
+
+# 날짜 해석 유틸
+# 날짜 해석 유틸 - 수정됨
+def resolve_relative_dates(text, base_date=None):
+    if base_date is None:
+        base_date = date.today()
+
+    replacements = {
+        "오늘": base_date,
+        "내일": base_date + timedelta(days=1),
+        "다음 날": base_date + timedelta(days=1),
+        "모레": base_date + timedelta(days=2),
+        "같은 날": base_date,
+    }
+
+    for key, value in replacements.items():
+        text = text.replace(key, value.strftime("%Y-%m-%d"))
+    return text
+
+
+def extract_schedule(text):
+    from datetime import time
+    schedules = []
+    parser = DateParser()
+    current_date = date.today()
+
+    # 고급 패턴으로 상대/절대/자연어 날짜 모두 포함
+    # task 패턴을 일반적인 활동도 포함하도록 수정
+    pattern = r'(?:(\d{1,2}월\s*\d{1,2}일|\d{4}-\d{2}-\d{2}|[가-힣\d]+\s*(일|주|개월|년)?\s*(후|뒤)|오늘|내일|모레|같은 날)?)?\s*(오전|오후)?\s*(\d{1,2})시.*?(?:에|에는|엔|때)?\s*([가-힣\s]+?(?:하|할|하기|예정|있|있어|있음|약속|계획).*?)(?=\s*\d{1,2}월|\s*\d{1,2}시|\s*$)'
+    matches = re.findall(pattern, text)
+
+    for m in matches:
+        raw_date_expr, _, _, ampm, hour, task = m
+
+        # 1. 날짜 처리
+        if raw_date_expr:
+            absolute_date, relative_date = parser.parse(raw_date_expr)
+            if absolute_date:
+                current_date = absolute_date.date()
+            elif relative_date:
+                current_date = relative_date.date()
+            else:
+                try:
+                    if '월' in raw_date_expr:
+                        raw_date = raw_date_expr.replace("월", "-").replace("일", "").replace(" ", "")
+                        current_date = datetime.strptime(f"2025-{raw_date}", "%Y-%m-%d").date()
+                    elif '-' in raw_date_expr:
+                        current_date = datetime.strptime(raw_date_expr, "%Y-%m-%d").date()
+                    elif raw_date_expr in ['오늘', '내일', '모레', '같은 날']:
+                        current_date = resolve_relative_dates(raw_date_expr)
+                except:
+                    current_date = date.today()
+
+        # 🔥 2. task 내부에 또 다른 상대 표현이 있으면 → current_date 재조정
+        # 상대 날짜 패턴 (예: "일주일 뒤", "3일 후" 등)
+        relative_pattern = r'([가-힣\d]+)\s*(일|주|개월|년)?\s*(후|뒤)'
+        relative_match = re.search(relative_pattern, task)
+
+        if relative_match:
+            amount_text = relative_match.group(1)
+            unit = relative_match.group(2) if relative_match.group(2) else '일'
+
+            # 한글 숫자 변환
+            amount = parser._convert_korean_to_number(amount_text)
+            if amount == 0 and amount_text.isdigit():
+                amount = int(amount_text)
+
+            # 기준 날짜 설정 (이전 일정의 날짜 사용)
+            base_date = datetime.combine(current_date, time(0, 0))
+
+            # 상대 날짜 계산
+            if unit == '개월':
+                new_month = base_date.month + amount
+                new_year = base_date.year + (new_month - 1) // 12
+                new_month = ((new_month - 1) % 12) + 1
+                current_date = base_date.replace(year=new_year, month=new_month).date()
+            elif unit == '년':
+                current_date = base_date.replace(year=base_date.year + amount).date()
+            else:
+                # timedelta로 처리 가능한 단위들
+                kwargs = {parser.time_units[unit]: amount}
+                current_date = (base_date + timedelta(**kwargs)).date()
+
+            # task에서 상대 날짜 표현 제거
+            task = re.sub(relative_pattern, '', task).strip()
+
+        # 3. 시간 처리
+        hour = int(hour)
+        if ampm == "오후" and hour < 12:
+            hour += 12
+        time_obj = time(hour=hour)
+
+        # task 정리 (조사와 종결어미 정리)
+        task = re.sub(r'(?:하기|할|하|있어|있음|예정|계획|거야|줘)$', '', task.strip())
+        task = re.sub(r'(?:에|에는|엔|때)?\s*$', '', task.strip())
+        task = re.sub(r'잡아', '', task.strip())
+
+        # 핵심 활동만 추출
+        core_task = task.strip()
+        if '약속' in core_task:
+            # "점심 약속" -> "점심"
+            core_task = re.sub(r'\s*약속.*$', '', core_task)
+
+        # 기타 불필요한 표현 제거
+        core_task = re.sub(r'(?:하기로|하기로 했어|하기로 해|하기로 함|할게|할래|할까|하자|할거야|할거에요|할 ).*$', '', core_task)
+        core_task = core_task.strip()
+
+        schedules.append({
+            "date": current_date,
+            "time": time_obj,
+            "task": core_task
+        })
+
+    return schedules
+
+
+def start_recording():
+    global is_recording
+    is_recording = True
+    status_label.config(text="🎤 음성 인식 중...")
+
+    def record_audio():
+        global is_recording
+        frames = []
+        vad_history.clear()
+        warmup_counter = 50
+        post_warmup_frames = 50
+
+        def callback(indata, frames, time, status):
+            if status:
+                print(status)
+            try:
+                audio_queue.put_nowait(indata.copy())
+            except queue.Full:
+                pass
+
+        with sd.InputStream(callback=callback, samplerate=SAMPLE_RATE, channels=1, blocksize=CHUNK_SIZE, device=1):
+            while is_recording:
+                try:
+                    # 큐에서 오디오 데이터 가져오기
+                    data = audio_queue.get_nowait()
+                    frames.append(data)
+
+                    # VAD로 음성 감지
+                    pcm_audio = (data * 32768).astype(np.int16)
+
+                    # ✅ 최소 녹음 보장 (처음 50개 프레임은 무조건 저장)
+                    if warmup_counter > 0:
+                        warmup_counter -= 1
+                        continue  # 1초 동안 무조건 녹음 유지
+                    try:
+                        is_speech = vad.is_speech(pcm_audio.tobytes(), SAMPLE_RATE)
+                    except webrtcvad.Error:
+                        print(f"⚠️ VAD Error: {e}")
+                        continue
+                    vad_history.append(1 if is_speech else 0)
+
+                    if post_warmup_frames > 0:
+                        post_warmup_frames -= 1
+                        continue
+
+                    # 최근 VAD 값 중 절반 이상이 침묵이면 종료
+                    if sum(vad_history) < SILENCE_THRESHOLD:
+                        print("음성 종료 감지, 변환 시작...")
+                        break
+                except queue.Empty:
+                    pass  # 큐가 비어있으면 무시하고 계속 진행
+
+            # 🎤 최소 녹음 길이 체크 (1초 미만이면 무시)
+            if len(frames) < 50:
+                print("⚠️ 녹음된 데이터가 너무 짧습니다. 다시 시도하세요.")
+                status_label.config(text="⚠️ 짧은 녹음. 다시 시도하세요.")
+                is_recording = False
+                return
+            # 1초 대기 후 변환 시작
+            root.after(1000, lambda: transcribe_audio(frames))
+
+    Thread(target=record_audio, daemon=True).start()
+
+
+def transcribe_audio(frames):
+    global is_recording
+    is_recording = False
+
+    audio_data = np.concatenate(frames, axis=0).flatten()
+    wav_filename = "recorded_audio.wav"
+    sf.write(wav_filename, audio_data, SAMPLE_RATE)
+    print(f"📏 Audio Data Shape: {audio_data.shape}")
+    print(f"🔊 Min: {audio_data.min()}, Max: {audio_data.max()}")
+
+    if os.path.exists(wav_filename):
+        print(f"✅ 파일 저장 완료: {wav_filename}, 크기: {os.path.getsize(wav_filename)} bytes")
+    else:
+        print("⚠️ 파일 저장 실패!")
+
+    result = model.transcribe(wav_filename, language="ko", fp16=False)
+    recognized_text = result["text"]
+
+    schedules = extract_schedule(recognized_text)
+
+    # 결과 출력
+    status_label.config(text="✅ 인식 완료!")
+    text_output.delete("1.0", tk.END)
+    text_output.insert(tk.END, recognized_text + "\n\n")
+
+    if schedules:
+        text_output.insert(tk.END, "📅 분석된 일정:\n")
+        for s in schedules:
+            text_output.insert(tk.END, f"- {s['date']} {s['time']} : {s['task']}\n")
+
+    print("Recognized Text:", recognized_text)
+
+
+# GUI 설정
+root = tk.Tk()
+root.title("음성 인식 일정 추출기")
+
+start_button = tk.Button(root, text="🎙️ 시작", command=start_recording, font=("Arial", 14))
+start_button.pack(pady=10)
+
+status_label = tk.Label(root, text="버튼을 눌러 음성 인식을 시작하세요", font=("Arial", 12))
+status_label.pack(pady=5)
+
+text_output = tk.Text(root, height=10, width=60, font=("Arial", 12))
+text_output.pack(pady=10)
+
+root.mainloop()
